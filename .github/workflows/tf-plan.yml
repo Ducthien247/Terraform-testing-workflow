@@ -161,9 +161,40 @@ jobs:
       ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
       ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
       ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      # TEMPORARY: the vault the teardown has to reach; remove with the steps below.
+      LEGACY_KV_NAME: vm-terraform-linux-kv
+      LEGACY_KV_RG:   rg-terraform-vm
 
     steps:
       - uses: actions/checkout@v4
+
+      # Unconditional because the temporary Key Vault step below needs it on
+      # every branch push. Once that step is gone only the lock check needs
+      # Azure, so this can go back to being main/workflow_dispatch only.
+      - name: Azure login
+        run: |
+          az login --service-principal             -u "$ARM_CLIENT_ID" -p "$ARM_CLIENT_SECRET"             --tenant "$ARM_TENANT_ID" --output none
+          az account set --subscription "$ARM_SUBSCRIPTION_ID"
+
+      # >>> TEMPORARY — legacy Key Vault teardown ------------------------------
+      # State still holds azurerm_key_vault_secret.admin_password. Refreshing
+      # (plan) and deleting (apply) it go through the vault's DATA plane, which
+      # its firewall blocks from a runner's IP — and the runner IP changes every
+      # run. Open a hole for this run so the teardown can complete.
+      # DELETE THIS STEP, its twin at the end of the job, and the LEGACY_KV_*
+      # env vars once the vault is gone from state.
+      - name: Whitelist runner IP in the legacy Key Vault
+        run: |
+          RUNNER_IP=$(curl -sf https://api.ipify.org)
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+          if az keyvault network-rule add \
+               --name "$LEGACY_KV_NAME" --resource-group "$LEGACY_KV_RG" \
+               --ip-address "$RUNNER_IP" --output none 2>/dev/null; then
+            sleep 30   # the ACL change is not effective immediately
+          else
+            echo "::notice::Legacy Key Vault '$LEGACY_KV_NAME' not reachable or already gone — nothing to whitelist."
+          fi
+      # <<< END TEMPORARY -------------------------------------------------------
 
       - name: Prime plugin cache dir
         run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
@@ -258,13 +289,6 @@ jobs:
             }
 
       # -- Main / manual: save the plan and open an approval issue ------------
-      - name: Azure login
-        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
-        run: |
-          az login --service-principal \
-            -u "$ARM_CLIENT_ID" -p "$ARM_CLIENT_SECRET" \
-            --tenant "$ARM_TENANT_ID" --output none
-          az account set --subscription "$ARM_SUBSCRIPTION_ID"
 
       # Advisory only: tells the reviewer up front whether approving will lift
       # the lock. The apply re-evaluates this itself, because the lock can change
@@ -335,3 +359,15 @@ jobs:
               labels: ['tf-apply-approval'],
             });
             core.notice(`Approval issue opened: ${issue.data.html_url}`);
+
+      # >>> TEMPORARY — legacy Key Vault teardown ------------------------------
+      # Twin of the whitelist step above; delete both together.
+      - name: Remove runner IP from the legacy Key Vault
+        if: always()
+        run: |
+          [[ -z "${RUNNER_IP:-}" ]] && exit 0
+          az keyvault network-rule remove \
+            --name "$LEGACY_KV_NAME" --resource-group "$LEGACY_KV_RG" \
+            --ip-address "$RUNNER_IP" --output none 2>/dev/null \
+          || echo "::notice::Could not delist runner IP — the vault is likely already destroyed."
+      # <<< END TEMPORARY -------------------------------------------------------

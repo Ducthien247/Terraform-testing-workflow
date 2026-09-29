@@ -115,18 +115,30 @@ Error: making Read request on Azure KeyVault Secret admin-password:
 ```
 
 That is a deadlock: the secret cannot be planned away because planning it
-requires reading it. Break it by making Terraform forget the secret. Run
-**Terraform State — Forget a resource** (`tf-state-rm.yml`) from the Actions
-tab with:
+requires reading it, and the runner's IP is different every run.
 
-| Input | Value |
-| --- | --- |
-| `address` | `azurerm_key_vault_secret.admin_password` |
-| `confirm` | `forget` |
+Both workflows currently carry a temporary step that punches the runner's IP
+into the vault firewall for the duration of the run and takes it out again
+afterwards. They are fenced off like this:
 
-Nothing is lost: the secret lives inside the vault, and the same plan destroys
-the vault. The vault itself is a control-plane resource, so it refreshes and
-destroys normally.
+```yaml
+      # >>> TEMPORARY — legacy Key Vault teardown
+      ...
+      # <<< END TEMPORARY
+```
+
+Once the teardown apply has destroyed the vault, delete both fenced blocks and
+the `LEGACY_KV_NAME` / `LEGACY_KV_RG` env vars from `tf-plan.yml` and
+`tf-apply-run.yml`. The steps are written to tolerate a missing vault, so they
+degrade to a no-op in the meantime rather than breaking the pipeline.
+
+The alternative, if you would rather not reopen the firewall at all, is to make
+Terraform forget the secret instead — run **Terraform State — Forget a
+resource** (`tf-state-rm.yml`) with `address` =
+`azurerm_key_vault_secret.admin_password` and `confirm` = `forget`. Note that
+`workflow_dispatch` workflows only appear in the Actions tab once they are on
+the **default branch**. Nothing is lost either way: the secret lives inside the
+vault, and the same plan destroys the vault.
 
 The provider is configured with `purge_soft_delete_on_destroy = false`, so the
 vault is soft-deleted rather than purged — purging needs a permission the CI
