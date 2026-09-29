@@ -44,8 +44,8 @@ thing it guards.
 Create it once, by hand or via the reconcile workflow:
 
 ```bash
-az lock create --name rg-terraform-vnet-lock \
-  --resource-group rg-terraform-vnet \
+az lock create --name rg-terraform-vm-lock \
+  --resource-group rg-terraform-vm \
   --lock-type CanNotDelete \
   --notes "Guardrail; lifted automatically by CI only for destructive applies"
 ```
@@ -86,7 +86,7 @@ scoped to the resource group, or a custom role with just the lock permissions:
 az role assignment create \
   --assignee <ARM_CLIENT_ID> \
   --role "User Access Administrator" \
-  --scope /subscriptions/<sub>/resourceGroups/rg-terraform-vnet
+  --scope /subscriptions/<sub>/resourceGroups/rg-terraform-vm
 ```
 
 Worth deciding deliberately: a pipeline that can remove its own lock is
@@ -100,6 +100,31 @@ runner is killed outright. `tf-lock-reconcile.yml` runs daily, re-asserts the
 lock declared by `RG_LOCK_LEVEL` / `RG_LOCK_NAME`, and opens an issue labelled
 `tf-lock-drift` when it had to. It shares the apply workflow's concurrency group
 so it can never fire while an apply has the lock deliberately lifted.
+
+## One-time teardown of the old VM stack
+
+State still holds the VM, NIC, NSG, public IP, subnet and Key Vault from the
+earlier template. They are gone from the configuration, so the next plan
+destroys them — but the plan first has to *refresh* them, and refreshing
+`azurerm_key_vault_secret.admin_password` goes through the Key Vault **data
+plane**, which its firewall blocks from a GitHub runner's IP:
+
+```
+Error: making Read request on Azure KeyVault Secret admin-password:
+  403 Forbidden ... InnerError={"code":"ForbiddenByFirewall"}
+```
+
+Drop the secret from state once, locally. The vault is being destroyed anyway,
+so the secret goes with it — nothing is orphaned:
+
+```bash
+terraform init -reconfigure   -backend-config="resource_group_name=<TFSTATE_RESOURCE_GROUP>"   -backend-config="storage_account_name=<TFSTATE_STORAGE_ACCOUNT>"   -backend-config="container_name=<TFSTATE_CONTAINER>"   -backend-config="key=hub-gec.tfstate"
+terraform state rm azurerm_key_vault_secret.admin_password
+```
+
+The vault itself is a control-plane resource, so it refreshes and destroys
+fine. After that one apply the pipeline is clean: no Key Vault, no runner-IP
+whitelisting, nothing IP-sensitive left in the stack.
 
 ## CI/CD (GitHub Actions)
 
@@ -173,7 +198,7 @@ Same page → **Variables** tab:
 | `RESOURCE_GROUP_NAME` | RG this stack manages — used both as `TF_VAR_resource_group_name` and as the lock target. Must match `resource_group_name` in your tfvars. |
 | `VNET_NAME` | Name of the virtual network (`TF_VAR_vnet_name`) |
 | `RG_LOCK_LEVEL` | Declared lock level: `None`, `CanNotDelete`, or `ReadOnly` |
-| `RG_LOCK_NAME` | Name of the declared lock, e.g. `rg-terraform-vnet-lock` |
+| `RG_LOCK_NAME` | Name of the declared lock, e.g. `rg-terraform-vm-lock` |
 
 ## Remote state backend
 

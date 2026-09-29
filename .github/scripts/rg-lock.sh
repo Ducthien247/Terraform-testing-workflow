@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Resource-group lock helper for the Terraform workflows.
 #
-#   status <rg> <plan.json>   Inspect the RG-scope locks and the plan, then emit
-#                             `level` and `needs_unlock` to $GITHUB_OUTPUT.
-#   unlock <rg>               Delete the locks recorded by `status`.
-#   restore <rg>              Recreate them with their original name/level/notes.
+#   status <plan.json>   Work out which RG the plan targets, inspect its
+#                        RG-scope locks, and emit `rg`, `level` and
+#                        `needs_unlock` to $GITHUB_OUTPUT.
+#   unlock <rg>          Delete the locks recorded by `status`.
+#   restore <rg>         Recreate them with their original name/level/notes.
 #
-# `status` writes the locks it found to $LOCK_BACKUP so `restore` can rebuild
-# them even if the apply failed partway through.
+# The RG name comes from the plan's own resolved variables rather than an
+# Actions variable, so the lock can never target a different group than the
+# apply does. `status` writes the locks it found to $LOCK_BACKUP so `restore`
+# can rebuild them even if the apply failed partway through.
 set -euo pipefail
 
 LOCK_BACKUP="${LOCK_BACKUP:-/tmp/rg-locks.json}"
@@ -16,12 +19,19 @@ LOCK_BACKUP="${LOCK_BACKUP:-/tmp/rg-locks.json}"
 # individual resources. Only the ones scoped to the RG itself matter here.
 RG_SCOPE_RE='^/subscriptions/[^/]+/resourcegroups/[^/]+/providers/Microsoft.Authorization/locks/[^/]+$'
 
+emit() { [ -n "${GITHUB_OUTPUT:-}" ] && echo "$1" >> "$GITHUB_OUTPUT"; return 0; }
+
 cmd=$1
-rg=$2
 
 case "$cmd" in
   status)
-    plan_json=$3
+    plan_json=$2
+
+    rg=$(jq -r '.variables.resource_group_name.value // empty' "$plan_json")
+    if [ -z "$rg" ]; then
+      echo "::error::Could not read resource_group_name from $plan_json." >&2
+      exit 1
+    fi
 
     if az group show --name "$rg" --output none 2>/dev/null; then
       az lock list --resource-group "$rg" --output json
@@ -49,18 +59,16 @@ case "$cmd" in
       ReadOnly)     [ "$changes"  -gt 0 ] && needs_unlock=true || needs_unlock=false ;;
     esac
 
-    if [ -n "${GITHUB_OUTPUT:-}" ]; then
-      {
-        echo "level=$level"
-        echo "needs_unlock=$needs_unlock"
-        echo "changes=$changes"
-        echo "destroys=$destroys"
-      } >> "$GITHUB_OUTPUT"
-    fi
-    echo "lock=$level changes=$changes destroys=$destroys -> needs_unlock=$needs_unlock"
+    emit "rg=$rg"
+    emit "level=$level"
+    emit "needs_unlock=$needs_unlock"
+    emit "changes=$changes"
+    emit "destroys=$destroys"
+    echo "rg=$rg lock=$level changes=$changes destroys=$destroys -> needs_unlock=$needs_unlock"
     ;;
 
   unlock)
+    rg=$2
     jq -r '.[].name' "$LOCK_BACKUP" | while read -r name; do
       az lock delete --name "$name" --resource-group "$rg" --output none
       echo "::warning::Removed lock '$name' on '$rg' for this apply; it will be restored afterwards."
@@ -68,10 +76,11 @@ case "$cmd" in
     ;;
 
   restore)
+    rg=$2
     [ -f "$LOCK_BACKUP" ] || exit 0
     jq -c '.[]' "$LOCK_BACKUP" | while read -r lock; do
-      name=$(jq -r '.name'      <<<"$lock")
-      lvl=$( jq -r '.level'     <<<"$lock")
+      name=$(jq -r '.name'         <<<"$lock")
+      lvl=$( jq -r '.level'        <<<"$lock")
       notes=$(jq -r '.notes // ""' <<<"$lock")
       # Idempotent: `az lock create` overwrites a lock of the same name, so a
       # re-run after a partial failure is safe.

@@ -161,8 +161,6 @@ jobs:
       ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
       ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
       ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
-      TF_VAR_resource_group_name: ${{ vars.RESOURCE_GROUP_NAME }}
-      TF_VAR_vnet_name:           ${{ vars.VNET_NAME }}
 
     steps:
       - uses: actions/checkout@v4
@@ -274,7 +272,7 @@ jobs:
       - name: Check RG lock against plan
         id: lock
         if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
-        run: .github/scripts/rg-lock.sh status "${{ vars.RESOURCE_GROUP_NAME }}" tfplan.json
+        run: .github/scripts/rg-lock.sh status tfplan.json
 
       - name: Upload tfplan for apply
         if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'

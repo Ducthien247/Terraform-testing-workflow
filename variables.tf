@@ -11,15 +11,15 @@ variable "location" {
 }
 
 variable "resource_group_name" {
-  description = "Name of the resource group. Must match the RESOURCE_GROUP_NAME Actions variable so the lock steps target the right group."
+  description = "Name of the resource group. The lock workflow reads this out of the plan, so it needs no separate CI variable."
   type        = string
-  default     = "rg-terraform-vnet"
+  default     = "rg-terraform-vm"
 }
 
 variable "vnet_name" {
   description = "Name of the virtual network."
   type        = string
-  default     = "vnet-terraform"
+  default     = "vm-terraform-linux-vnet"
 }
 
 variable "address_space" {

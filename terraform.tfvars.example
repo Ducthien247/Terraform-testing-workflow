@@ -3,8 +3,8 @@
 subscription_id = "00000000-0000-0000-0000-000000000000"
 
 location            = "eastus"
-resource_group_name = "rg-terraform-vnet"
-vnet_name           = "vnet-terraform"
+resource_group_name = "rg-terraform-vm"
+vnet_name           = "vm-terraform-linux-vnet"
 address_space       = ["10.0.0.0/16"]
 
 tags = {

@@ -51,8 +51,6 @@ jobs:
       ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
       ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
       ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
-      TF_VAR_resource_group_name: ${{ vars.RESOURCE_GROUP_NAME }}
-      TF_VAR_vnet_name:           ${{ vars.VNET_NAME }}
       LOCK_BACKUP: ${{ github.workspace }}/rg-locks.json
 
     steps:
@@ -114,11 +112,11 @@ jobs:
       # been added, changed or removed while the issue waited for approval.
       - name: Check RG lock against approved plan
         id: lock
-        run: .github/scripts/rg-lock.sh status "${{ vars.RESOURCE_GROUP_NAME }}" tfplan.json
+        run: .github/scripts/rg-lock.sh status tfplan.json
 
       - name: Lift RG lock for this apply
         if: steps.lock.outputs.needs_unlock == 'true'
-        run: .github/scripts/rg-lock.sh unlock "${{ vars.RESOURCE_GROUP_NAME }}"
+        run: .github/scripts/rg-lock.sh unlock "${{ steps.lock.outputs.rg }}"
 
       # Applies the exact plan that was reviewed. If state drifted since the
       # plan was created, Terraform refuses the stale plan (safe by design).
@@ -129,7 +127,7 @@ jobs:
       # runner itself dies, tf-lock-reconcile.yml puts it back on its next run.
       - name: Restore RG lock
         if: always() && steps.lock.outputs.needs_unlock == 'true'
-        run: .github/scripts/rg-lock.sh restore "${{ vars.RESOURCE_GROUP_NAME }}"
+        run: .github/scripts/rg-lock.sh restore "${{ steps.lock.outputs.rg }}"
 
       - name: Report success & close issue
         if: success()
