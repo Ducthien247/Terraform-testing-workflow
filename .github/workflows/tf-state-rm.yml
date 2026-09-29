@@ -1,0 +1,87 @@
+name: "Terraform State — Forget a resource"
+
+# Manual state surgery. `terraform state rm` makes Terraform forget a resource
+# WITHOUT destroying it in Azure.
+#
+# The case this exists for: a resource whose refresh cannot succeed from a
+# runner (e.g. a Key Vault secret behind a vault firewall) blocks every plan,
+# so it can never be planned away. Forgetting it unblocks the pipeline; if the
+# thing itself still needs deleting, delete it out of band.
+#
+# Deliberately manual-only, and it makes you type the address and the word
+# "forget" so it cannot fire by accident.
+
+on:
+  workflow_dispatch:
+    inputs:
+      address:
+        description: "Resource address, e.g. azurerm_key_vault_secret.admin_password"
+        required: true
+        type: string
+      confirm:
+        description: 'Type "forget" to confirm'
+        required: true
+        type: string
+
+# Shares the apply group so it can never run concurrently with an apply.
+concurrency:
+  group: terraform-apply-gec
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "1.5.7"
+
+jobs:
+  state-rm:
+    name: terraform state rm
+    runs-on: ubuntu-latest
+    env:
+      ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+    steps:
+      - name: Check confirmation
+        run: |
+          if [[ "${{ inputs.confirm }}" != "forget" ]]; then
+            echo '::error::Confirmation text must be exactly "forget".' >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=hub-gec.tfstate"
+
+      # The backend keeps versioned state, but an explicit copy in the run
+      # artifacts is cheaper to find than a blob version if this goes wrong.
+      - name: Back up current state
+        run: terraform state pull > state-before.json
+
+      - name: Upload state backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-before-${{ github.run_id }}
+          path: state-before.json
+          retention-days: 30
+
+      - name: Forget the resource
+        run: |
+          echo "Forgetting: ${{ inputs.address }}"
+          terraform state rm "${{ inputs.address }}"
+
+      - name: Show remaining state
+        run: terraform state list

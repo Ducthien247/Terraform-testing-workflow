@@ -107,24 +107,35 @@ State still holds the VM, NIC, NSG, public IP, subnet and Key Vault from the
 earlier template. They are gone from the configuration, so the next plan
 destroys them — but the plan first has to *refresh* them, and refreshing
 `azurerm_key_vault_secret.admin_password` goes through the Key Vault **data
-plane**, which its firewall blocks from a GitHub runner's IP:
+plane**, which the vault firewall blocks from a GitHub runner:
 
 ```
 Error: making Read request on Azure KeyVault Secret admin-password:
   403 Forbidden ... InnerError={"code":"ForbiddenByFirewall"}
 ```
 
-Drop the secret from state once, locally. The vault is being destroyed anyway,
-so the secret goes with it — nothing is orphaned:
+That is a deadlock: the secret cannot be planned away because planning it
+requires reading it. Break it by making Terraform forget the secret. Run
+**Terraform State — Forget a resource** (`tf-state-rm.yml`) from the Actions
+tab with:
 
-```bash
-terraform init -reconfigure   -backend-config="resource_group_name=<TFSTATE_RESOURCE_GROUP>"   -backend-config="storage_account_name=<TFSTATE_STORAGE_ACCOUNT>"   -backend-config="container_name=<TFSTATE_CONTAINER>"   -backend-config="key=hub-gec.tfstate"
-terraform state rm azurerm_key_vault_secret.admin_password
-```
+| Input | Value |
+| --- | --- |
+| `address` | `azurerm_key_vault_secret.admin_password` |
+| `confirm` | `forget` |
 
-The vault itself is a control-plane resource, so it refreshes and destroys
-fine. After that one apply the pipeline is clean: no Key Vault, no runner-IP
-whitelisting, nothing IP-sensitive left in the stack.
+Nothing is lost: the secret lives inside the vault, and the same plan destroys
+the vault. The vault itself is a control-plane resource, so it refreshes and
+destroys normally.
+
+The provider is configured with `purge_soft_delete_on_destroy = false`, so the
+vault is soft-deleted rather than purged — purging needs a permission the CI
+principal may not have, and a failed purge would fail the whole apply. The
+soft-deleted vault expires on its own after its 7-day retention. Once it is out
+of state you can drop the `key_vault` block from `versions.tf`.
+
+After that apply the stack is just the resource group and the virtual network:
+no Key Vault, no runner-IP whitelisting, nothing IP-sensitive left.
 
 ## CI/CD (GitHub Actions)
 
@@ -135,6 +146,7 @@ whitelisting, nothing IP-sensitive left in the stack.
 | `tf-plan.yml` | Push to `main`, or manual | Plans, saves `tfplan` + `tfplan.json`, reports the lock verdict, opens an approval **issue**. |
 | `tf-apply-run.yml` | Comment on the approval issue | On an authorized `/approve`, lifts the lock if the plan needs it, applies, restores the lock, closes the issue. `/deny` closes without applying. |
 | `tf-lock-reconcile.yml` | Daily cron, or manual | Re-asserts the declared RG lock and reports drift. |
+| `tf-state-rm.yml` | Manual only | Makes Terraform forget a resource without destroying it. Backs the state up to a run artifact first. |
 
 A lock never blocks `terraform plan` — reading ARM is permitted under both
 levels — so the plan job only *reports* the verdict. The apply job recomputes it
