@@ -3,17 +3,10 @@
 subscription_id = "00000000-0000-0000-0000-000000000000"
 
 location            = "eastus"
-resource_group_name = "rg-terraform-vm"
-vm_name             = "vm-terraform-linux"
-admin_username      = "azureuser"
+resource_group_name = "rg-terraform-vnet"
+vnet_name           = "vnet-terraform"
+address_space       = ["10.0.0.0/16"]
 
-# Required. Use: ssh-keygen -t ed25519 -f ~/.ssh/azure_vm
-# In CI this is supplied via the ADMIN_SSH_PUBLIC_KEY secret, not this file.
-admin_ssh_public_key = "ssh-ed25519 AAAA... replace-me"
-
-# Restrict this to your public IP/CIDR, for example "203.0.113.10/32".
-allowed_ssh_source = "0.0.0.0/0"
-
-# Your machine's public IP — only this IP can reach the Key Vault.
-# Find yours with: (Invoke-WebRequest https://api.ipify.org).Content
-keyvault_allowed_ip = "170.248.134.67"
+tags = {
+  managed_by = "terraform"
+}

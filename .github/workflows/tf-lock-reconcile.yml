@@ -1,0 +1,103 @@
+name: "RG Lock — Reconcile"
+
+# The apply workflow restores the lock in an `always()` step, but that step
+# cannot run if the runner is killed mid-apply (cancellation, timeout, spot
+# reclaim). This closes that gap: it re-asserts the lock declared by the
+# RG_LOCK_LEVEL / RG_LOCK_NAME Actions variables and shouts if it had to.
+
+on:
+  schedule:
+    - cron: "17 2 * * *"   # daily, 02:17 UTC
+  workflow_dispatch:
+
+# Shares the apply workflow's group so it can never fire while an apply has
+# deliberately lifted the lock.
+concurrency:
+  group: terraform-apply-gec
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  reconcile:
+    name: Re-assert the declared RG lock
+    runs-on: ubuntu-latest
+    env:
+      ARM_CLIENT_ID:     ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID:     ${{ secrets.ARM_TENANT_ID }}
+      RG:         ${{ vars.RESOURCE_GROUP_NAME }}
+      LOCK_LEVEL: ${{ vars.RG_LOCK_LEVEL }}   # None | CanNotDelete | ReadOnly
+      LOCK_NAME:  ${{ vars.RG_LOCK_NAME }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        run: |
+          az login --service-principal \
+            -u "$ARM_CLIENT_ID" -p "$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID" --output none
+          az account set --subscription "${{ secrets.ARM_SUBSCRIPTION_ID }}"
+
+      - name: Reconcile
+        id: rec
+        run: |
+          set -euo pipefail
+
+          if [ "${LOCK_LEVEL:-None}" = "None" ] || [ -z "${LOCK_LEVEL:-}" ]; then
+            echo "RG_LOCK_LEVEL is None — nothing to enforce."
+            echo "drifted=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! az group show --name "$RG" --output none 2>/dev/null; then
+            echo "::notice::Resource group '$RG' does not exist yet — nothing to lock."
+            echo "drifted=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          actual=$(az lock show --name "$LOCK_NAME" --resource-group "$RG" \
+                     --query level -o tsv 2>/dev/null || echo "")
+
+          if [ "$actual" = "$LOCK_LEVEL" ]; then
+            echo "Lock '$LOCK_NAME' on '$RG' is '$actual' as declared."
+            echo "drifted=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::warning::Lock drift on '$RG': found '${actual:-<missing>}', expected '$LOCK_LEVEL'. Re-asserting."
+          az lock create --name "$LOCK_NAME" --resource-group "$RG" \
+            --lock-type "$LOCK_LEVEL" --notes "Declared by RG_LOCK_LEVEL; re-asserted by tf-lock-reconcile" \
+            --output none
+          echo "drifted=true" >> "$GITHUB_OUTPUT"
+          echo "found=${actual:-missing}" >> "$GITHUB_OUTPUT"
+
+      # Drift here means an apply lifted the lock and never put it back, so it
+      # is worth a human look rather than a silent fix.
+      - name: Raise an issue on drift
+        if: steps.rec.outputs.drifted == 'true'
+        uses: actions/github-script@v7
+        env:
+          FOUND: ${{ steps.rec.outputs.found }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `RG lock drift on ${process.env.RG || 'the resource group'}`,
+              body: [
+                `The declared lock was \`${process.env.LOCK_LEVEL}\` but the live lock was \`${process.env.FOUND}\`.`,
+                'It has been re-asserted automatically.',
+                '',
+                'Most likely an apply lifted the lock and its restore step never ran',
+                '(cancelled run, runner timeout). Check recent applies.',
+                '',
+                `[View reconcile run](${runUrl})`,
+              ].join('\n'),
+              labels: ['tf-lock-drift'],
+            });

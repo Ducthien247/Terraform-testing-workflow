@@ -5,48 +5,31 @@ variable "subscription_id" {
 }
 
 variable "location" {
-  description = "Azure region for the VM."
+  description = "Azure region."
   type        = string
   default     = "eastus"
 }
 
 variable "resource_group_name" {
-  description = "Name of the resource group."
+  description = "Name of the resource group. Must match the RESOURCE_GROUP_NAME Actions variable so the lock steps target the right group."
   type        = string
-  default     = "rg-terraform-vm"
+  default     = "rg-terraform-vnet"
 }
 
-variable "vm_name" {
-  description = "Name of the virtual machine."
+variable "vnet_name" {
+  description = "Name of the virtual network."
   type        = string
-  default     = "vm-terraform-linux"
+  default     = "vnet-terraform"
 }
 
-variable "admin_username" {
-  description = "Linux administrator username."
-  type        = string
-  default     = "azureuser"
+variable "address_space" {
+  description = "Address space of the virtual network."
+  type        = list(string)
+  default     = ["10.0.0.0/16"]
 }
 
-variable "admin_ssh_public_key" {
-  description = "Contents of the SSH public key used to access the VM."
-  type        = string
-  sensitive   = true
-}
-
-variable "allowed_ssh_source" {
-  description = "CIDR allowed to connect over SSH. Replace the default with your public IP/CIDR."
-  type        = string
-  default     = "0.0.0.0/0"
-}
-
-variable "vm_size" {
-  description = "Azure VM size."
-  type        = string
-  default     = "Standard_B2ats_v2"
-}
-
-variable "keyvault_allowed_ip" {
-  description = "Your machine's public IP address allowed to access the Key Vault (e.g. '203.0.113.10'). Find it with: curl https://api.ipify.org"
-  type        = string
+variable "tags" {
+  description = "Tags applied to the resource group and the virtual network."
+  type        = map(string)
+  default     = { managed_by = "terraform" }
 }
