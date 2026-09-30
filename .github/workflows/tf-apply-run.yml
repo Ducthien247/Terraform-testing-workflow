@@ -1,14 +1,25 @@
 name: "Terraform Apply — Apply on Approval"
 
-# Trigger: a comment on an approval issue opened by tf-apply-gec.yml.
+# Trigger: a comment on an approval issue opened by tf-plan.yml.
 # Applies only when an authorized reviewer comments "/approve" on an issue
 # labelled "tf-apply-approval". A "/deny" comment closes the issue instead.
 # Uses only first-party actions.
+#
+# Resource-group lock handling: the lock is deliberately NOT managed by
+# Terraform (a lock in state that CI deletes out from under it just creates
+# drift). The apply inspects the live lock and the saved plan, and only lifts
+# the lock when the plan actually needs it:
+#
+#   CanNotDelete + no destroys -> lock stays on
+#   CanNotDelete + destroys    -> lift, apply, restore
+#   ReadOnly     + no changes  -> lock stays on
+#   ReadOnly     + any change  -> lift, apply, restore
 
 on:
   issue_comment:
     types: [created]
 
+# Serialised so two applies can never race on removing/restoring the lock.
 concurrency:
   group: terraform-apply-gec
   cancel-in-progress: false
@@ -40,25 +51,12 @@ jobs:
       ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
       ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
       ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
-      TF_VAR_admin_ssh_public_key: ${{ secrets.ADMIN_SSH_PUBLIC_KEY }}
-      TF_VAR_keyvault_allowed_ip:  ${{ vars.KEYVAULT_ALLOWED_IP }}
+      LOCK_BACKUP: ${{ github.workspace }}/rg-locks.json
+      # TEMPORARY: the vault the teardown has to reach; remove with the steps below.
+      LEGACY_KV_NAME: vm-terraform-linux-kv
+      LEGACY_KV_RG:   rg-terraform-vm
 
     steps:
-      - name: Whitelist runner IP in Key Vault
-        run: |
-          RUNNER_IP=$(curl -sf https://api.ipify.org)
-          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
-          az login --service-principal \
-            -u "$ARM_CLIENT_ID" -p "$ARM_CLIENT_SECRET" \
-            --tenant "$ARM_TENANT_ID" --output none
-          az account set --subscription "$ARM_SUBSCRIPTION_ID"
-          az keyvault network-rule add \
-            --name "${{ vars.KEYVAULT_NAME }}" \
-            --resource-group "${{ vars.KEYVAULT_RESOURCE_GROUP }}" \
-            --ip-address "$RUNNER_IP" \
-            --output none
-          sleep 30
-
       - name: Acknowledge approval
         uses: actions/github-script@v7
         with:
@@ -106,23 +104,88 @@ jobs:
             -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
             -backend-config="key=hub-gec.tfstate"
 
+      - name: Azure login
+        run: |
+          az login --service-principal \
+            -u "$ARM_CLIENT_ID" -p "$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID" --output none
+          az account set --subscription "$ARM_SUBSCRIPTION_ID"
+
+      # >>> TEMPORARY — legacy Key Vault teardown ------------------------------
+      # State still holds azurerm_key_vault_secret.admin_password. Refreshing
+      # (plan) and deleting (apply) it go through the vault's DATA plane, which
+      # its firewall blocks from a runner's IP — and the runner IP changes every
+      # run. Open a hole for this run so the teardown can complete.
+      # DELETE THIS STEP, its twin at the end of the job, and the LEGACY_KV_*
+      # env vars once the vault is gone from state.
+      - name: Whitelist runner IP in the legacy Key Vault
+        run: |
+          RUNNER_IP=$(curl -sf https://api.ipify.org)
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+          if az keyvault network-rule add \
+               --name "$LEGACY_KV_NAME" --resource-group "$LEGACY_KV_RG" \
+               --ip-address "$RUNNER_IP" --output none 2>/dev/null; then
+            sleep 30   # the ACL change is not effective immediately
+          else
+            echo "::notice::Legacy Key Vault '$LEGACY_KV_NAME' not reachable or already gone — nothing to whitelist."
+          fi
+      # <<< END TEMPORARY -------------------------------------------------------
+
+      # Re-evaluated here rather than trusting the plan run: the lock may have
+      # been added, changed or removed while the issue waited for approval.
+      - name: Check RG lock against approved plan
+        id: lock
+        run: .github/scripts/rg-lock.sh status tfplan.json
+
+      - name: Lift RG lock for this apply
+        if: steps.lock.outputs.needs_unlock == 'true'
+        run: .github/scripts/rg-lock.sh unlock "${{ steps.lock.outputs.rg }}"
+
       # Applies the exact plan that was reviewed. If state drifted since the
       # plan was created, Terraform refuses the stale plan (safe by design).
       - name: Terraform Apply
         run: terraform apply -input=false tfplan
 
+      # >>> TEMPORARY — legacy Key Vault teardown ------------------------------
+      # Twin of the whitelist step above; delete both together.
+      - name: Remove runner IP from the legacy Key Vault
+        if: always()
+        run: |
+          [[ -z "${RUNNER_IP:-}" ]] && exit 0
+          az keyvault network-rule remove \
+            --name "$LEGACY_KV_NAME" --resource-group "$LEGACY_KV_RG" \
+            --ip-address "$RUNNER_IP" --output none 2>/dev/null \
+          || echo "::notice::Could not delist runner IP — the vault is likely already destroyed."
+      # <<< END TEMPORARY -------------------------------------------------------
+
+      # `always()` so the lock comes back even when the apply fails. If the
+      # runner itself dies, tf-lock-reconcile.yml puts it back on its next run.
+      - name: Restore RG lock
+        if: always() && steps.lock.outputs.needs_unlock == 'true'
+        run: .github/scripts/rg-lock.sh restore "${{ steps.lock.outputs.rg }}"
+
       - name: Report success & close issue
         if: success()
         uses: actions/github-script@v7
+        env:
+          LOCK_LEVEL:   ${{ steps.lock.outputs.level }}
+          NEEDS_UNLOCK: ${{ steps.lock.outputs.needs_unlock }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const { LOCK_LEVEL, NEEDS_UNLOCK } = process.env;
+            const lockNote =
+              LOCK_LEVEL === 'None'
+                ? ''
+                : NEEDS_UNLOCK === 'true'
+                  ? `\n🔒 The \`${LOCK_LEVEL}\` lock was lifted for the apply and has been restored.`
+                  : `\n🔒 The \`${LOCK_LEVEL}\` lock stayed on throughout.`;
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: `✅ Terraform apply succeeded. [View logs](${runUrl})`,
+              body: `✅ Terraform apply succeeded. [View logs](${runUrl})${lockNote}`,
             });
             await github.rest.issues.update({
               owner: context.repo.owner,
@@ -130,17 +193,6 @@ jobs:
               issue_number: context.issue.number,
               state: 'closed',
             });
-
-      - name: Remove runner IP from Key Vault
-        if: always()
-        run: |
-          [[ -z "$RUNNER_IP" ]] && exit 0
-          az keyvault network-rule remove \
-            --name "${{ vars.KEYVAULT_NAME }}" \
-            --resource-group "${{ vars.KEYVAULT_RESOURCE_GROUP }}" \
-            --ip-address "$RUNNER_IP" \
-            --output none \
-          || true
 
       - name: Report failure
         if: failure()

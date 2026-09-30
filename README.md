@@ -1,29 +1,27 @@
-# Azure Linux VM Terraform Template
+# Azure VNet Terraform Template
 
-This template creates an Azure resource group, virtual network, subnet, public IP, network security group, network interface, and Ubuntu 22.04 Linux VM.
+Creates an Azure resource group and a virtual network in it. That is the whole
+stack — it is deliberately minimal so the CI/CD and resource-group-lock flow
+around it can be exercised without a deploy failing for unrelated reasons.
 
 ## Prerequisites
 
 - Terraform >= 1.5
 - Azure CLI
-- An SSH key pair
-
-Authenticate with Azure CLI and select the subscription:
 
 ```powershell
 az login
 az account set --subscription <subscription-id>
 ```
 
-Copy the example variables file and replace the placeholder SSH key and subscription ID:
+Copy the example variables file and fill in your subscription ID:
 
 ```powershell
 Copy-Item terraform.tfvars.example terraform.tfvars
 ```
 
-State is stored in an Azure Blob Storage backend (partial config), so `init`
-needs the backend details. Point these at an existing storage account (see
-[Remote state backend](#remote-state-backend)):
+State lives in an Azure Blob Storage backend (partial config), so `init` needs
+the backend details — see [Remote state backend](#remote-state-backend):
 
 ```powershell
 terraform init `
@@ -35,32 +33,137 @@ terraform plan
 terraform apply
 ```
 
-Connect using the `ssh_command` output:
+## Resource group lock
 
-```powershell
-terraform output -raw ssh_command
+The resource group can carry an Azure management lock. The lock is **not**
+managed by Terraform on purpose: if it lived in state and CI deleted it to get
+an apply through, state would immediately disagree with reality and every
+subsequent plan would want to recreate it. A guardrail should sit outside the
+thing it guards.
+
+Create it once, by hand or via the reconcile workflow:
+
+```bash
+az lock create --name rg-terraform-vm-lock \
+  --resource-group rg-terraform-vm \
+  --lock-type CanNotDelete \
+  --notes "Guardrail; lifted automatically by CI only for destructive applies"
 ```
 
-Destroy the resources when finished:
+### When CI lifts it
 
-```powershell
-terraform destroy
+`.github/scripts/rg-lock.sh` compares the live lock against the saved plan JSON
+and lifts the lock only when the plan genuinely cannot proceed without it:
+
+| Lock | Plan contents | Lock lifted? |
+| --- | --- | --- |
+| none | anything | no |
+| `CanNotDelete` | only creates / updates / no-ops | **no** |
+| `CanNotDelete` | any delete or replace | yes |
+| `ReadOnly` | all no-ops | **no** |
+| `ReadOnly` | any change at all | yes |
+
+`CanNotDelete` only blocks deletes, so routine applies that add or modify
+resources run with the lock still on. Replaces count as deletes — Terraform
+reports them as `["delete","create"]` in the plan JSON, so they are caught.
+
+`ReadOnly` is far more disruptive than it sounds: it blocks every control-plane
+write, including things that feel read-only (listing storage account keys, VM
+start/stop, editing a Key Vault's network ACLs). `CanNotDelete` is the
+recommended level here.
+
+Note that locks are an ARM control-plane mechanism. They do not touch the data
+plane — blob contents and Key Vault secrets stay writable under either level,
+and the Terraform state blob lease is unaffected.
+
+### Who can lift it
+
+Managing locks needs `Microsoft.Authorization/locks/*`, which **Contributor does
+not have**. Grant the CI service principal either `User Access Administrator`
+scoped to the resource group, or a custom role with just the lock permissions:
+
+```bash
+az role assignment create \
+  --assignee <ARM_CLIENT_ID> \
+  --role "User Access Administrator" \
+  --scope /subscriptions/<sub>/resourceGroups/rg-terraform-vm
 ```
 
-For security, set `allowed_ssh_source` to your own public IP in CIDR format, such as `203.0.113.10/32`, instead of allowing SSH from everywhere.
+Worth deciding deliberately: a pipeline that can remove its own lock is
+protected against *accidents*, not against *a bad pipeline*. If you want the
+lock to stop CI too, withhold the permission and lift it manually.
 
-Do not commit `terraform.tfvars` if it contains private values. It is ignored by the recommended `.gitignore` below if you add one to the project.
+### Drift recovery
+
+The apply restores the lock in an `always()` step, but that cannot run if the
+runner is killed outright. `tf-lock-reconcile.yml` runs daily, re-asserts the
+lock declared by `RG_LOCK_LEVEL` / `RG_LOCK_NAME`, and opens an issue labelled
+`tf-lock-drift` when it had to. It shares the apply workflow's concurrency group
+so it can never fire while an apply has the lock deliberately lifted.
+
+## One-time teardown of the old VM stack
+
+State still holds the VM, NIC, NSG, public IP, subnet and Key Vault from the
+earlier template. They are gone from the configuration, so the next plan
+destroys them — but the plan first has to *refresh* them, and refreshing
+`azurerm_key_vault_secret.admin_password` goes through the Key Vault **data
+plane**, which the vault firewall blocks from a GitHub runner:
+
+```
+Error: making Read request on Azure KeyVault Secret admin-password:
+  403 Forbidden ... InnerError={"code":"ForbiddenByFirewall"}
+```
+
+That is a deadlock: the secret cannot be planned away because planning it
+requires reading it, and the runner's IP is different every run.
+
+Both workflows currently carry a temporary step that punches the runner's IP
+into the vault firewall for the duration of the run and takes it out again
+afterwards. They are fenced off like this:
+
+```yaml
+      # >>> TEMPORARY — legacy Key Vault teardown
+      ...
+      # <<< END TEMPORARY
+```
+
+Once the teardown apply has destroyed the vault, delete both fenced blocks and
+the `LEGACY_KV_NAME` / `LEGACY_KV_RG` env vars from `tf-plan.yml` and
+`tf-apply-run.yml`. The steps are written to tolerate a missing vault, so they
+degrade to a no-op in the meantime rather than breaking the pipeline.
+
+The alternative, if you would rather not reopen the firewall at all, is to make
+Terraform forget the secret instead — run **Terraform State — Forget a
+resource** (`tf-state-rm.yml`) with `address` =
+`azurerm_key_vault_secret.admin_password` and `confirm` = `forget`. Note that
+`workflow_dispatch` workflows only appear in the Actions tab once they are on
+the **default branch**. Nothing is lost either way: the secret lives inside the
+vault, and the same plan destroys the vault.
+
+The provider is configured with `purge_soft_delete_on_destroy = false`, so the
+vault is soft-deleted rather than purged — purging needs a permission the CI
+principal may not have, and a failed purge would fail the whole apply. The
+soft-deleted vault expires on its own after its 7-day retention. Once it is out
+of state you can drop the `key_vault` block from `versions.tf`.
+
+After that apply the stack is just the resource group and the virtual network:
+no Key Vault, no runner-IP whitelisting, nothing IP-sensitive left.
 
 ## CI/CD (GitHub Actions)
 
-Two workflows in `.github/workflows/` run Terraform in CI:
-
 | Workflow | Trigger | Behaviour |
 | --- | --- | --- |
-| `tf-plan-gec.yml` | Push to **any** branch | Runs `terraform plan`, publishes it to the run **Summary**, and saves the output as `plan-<sha>`. If the branch has an open PR, updates its sticky comment. |
-| `tf-plan-gec.yml` | PR to `main` (opened/reopened) | **Reuses** the saved plan for the PR's head commit if the code is unchanged (no re-plan); otherwise plans fresh. Posts a sticky PR comment. |
-| `tf-plan-gec.yml` | Push to `main`, or manual | Runs `terraform plan`, saves the `tfplan` artifact, and opens an approval **issue**. |
-| `tf-apply-run-gec.yml` | Comment on the approval issue | On an authorized `/approve` comment, applies the saved plan and closes the issue. `/deny` closes it without applying. |
+| `tf-plan.yml` | Push to **any** branch | Runs `terraform plan`, publishes it to the run **Summary**, saves the output as `plan-<sha>`. If the branch has an open PR, updates its sticky comment. |
+| `tf-plan.yml` | PR to `main` (opened/reopened) | **Reuses** the saved plan for the PR's head commit if the code is unchanged; otherwise plans fresh. Posts a sticky PR comment. |
+| `tf-plan.yml` | Push to `main`, or manual | Plans, saves `tfplan` + `tfplan.json`, reports the lock verdict, opens an approval **issue**. |
+| `tf-apply-run.yml` | Comment on the approval issue | On an authorized `/approve`, lifts the lock if the plan needs it, applies, restores the lock, closes the issue. `/deny` closes without applying. |
+| `tf-lock-reconcile.yml` | Daily cron, or manual | Re-asserts the declared RG lock and reports drift. |
+| `tf-state-rm.yml` | Manual only | Makes Terraform forget a resource without destroying it. Backs the state up to a run artifact first. |
+
+A lock never blocks `terraform plan` — reading ARM is permitted under both
+levels — so the plan job only *reports* the verdict. The apply job recomputes it
+from scratch rather than trusting the plan run, because the lock may change
+while the approval issue waits.
 
 ### Plan reuse (avoid duplicate planning)
 
@@ -75,39 +178,26 @@ The plan workflow identifies "same code" by **commit SHA**:
   handled by the push run (which also updates the PR comment), so the same code
   is never planned twice.
 
-Reused plans are **previews** — a saved plan reflects the Azure state at push
-time. The plan that actually gets applied is always regenerated fresh at merge to
-`main` (and saved as `tfplan`), so the apply is never based on a reused preview.
-
-Plan runs are scoped with a `paths` filter (only `*.tf` / `.terraform.lock.hcl`
-changes) and cache the provider plugins, so non-Terraform commits don't trigger
-runs and each run skips re-downloading providers.
+Reused plans are **previews**. The plan that actually gets applied is always
+regenerated fresh at merge to `main` (and saved as `tfplan`).
 
 ### Issue-based approval (ChatOps)
 
 Deployment is gated by an issue-based approval that uses only first-party
 actions (works under org policies that block third-party actions):
 
-1. **On a PR to `main`**, the plan runs and is posted as a comment on the PR so
-   you can review before merging. No approval issue is created yet.
-2. **When code lands on `main`** (a merge/push, or a manual run of the plan
-   workflow), the plan runs and opens an issue (labelled `tf-apply-approval`)
-   containing the plan.
-3. An authorized reviewer reads the plan and comments **`/approve`** on that
-   issue. That fires **Terraform Apply (GEC) — Apply on Approval**, which applies
-   and closes the issue. Commenting **`/deny`** closes it without applying.
+1. **On a PR to `main`**, the plan runs and is posted as a comment on the PR.
+2. **When code lands on `main`**, the plan runs and opens an issue (labelled
+   `tf-apply-approval`) containing the plan and the lock verdict.
+3. A reviewer comments **`/approve`** on that issue, which applies and closes it.
+   **`/deny`** closes it without applying.
 
-Only users with write access (issue-comment `author_association` of `OWNER`,
-`MEMBER`, or `COLLABORATOR`) can approve; comments from anyone else are ignored.
+Only users with write access (`author_association` of `OWNER`, `MEMBER`, or
+`COLLABORATOR`) can approve.
 
-> The apply applies the **exact plan** you reviewed: the plan run uploads the
-> `tfplan` as an artifact, records its run id in the issue, and the apply
-> downloads that artifact and runs `terraform apply tfplan`. If the state drifted
-> since the plan was created, Terraform rejects the stale plan (safe by design) —
+> The apply applies the **exact plan** you reviewed. If the state drifted since
+> the plan was created, Terraform rejects the stale plan (safe by design) —
 > re-run the plan to produce a fresh approval issue.
->
-> The approval issue is created from `main` so the reviewed plan and the applied
-> state stay aligned (`issue_comment`-triggered runs always use `main`).
 
 ### Required secrets
 
@@ -119,27 +209,26 @@ Settings → Secrets and variables → Actions → **Secrets**:
 | `ARM_CLIENT_SECRET` | Service principal secret |
 | `ARM_TENANT_ID` | Azure AD tenant ID |
 | `ARM_SUBSCRIPTION_ID` | Target subscription ID |
-| `ADMIN_SSH_PUBLIC_KEY` | Contents of your SSH public key (passed as `TF_VAR_admin_ssh_public_key`) |
 
 ### Required variables
 
-Same page → **Variables** tab (these are not sensitive):
+Same page → **Variables** tab:
 
 | Variable | Purpose |
 | --- | --- |
 | `TFSTATE_RESOURCE_GROUP` | Resource group holding the state storage account |
 | `TFSTATE_STORAGE_ACCOUNT` | Storage account name for remote state |
 | `TFSTATE_CONTAINER` | Blob container name for remote state |
-| `KEYVAULT_ALLOWED_IP` | Your machine's public IP allowed to access the Key Vault (not sensitive — stored as a variable, not a secret) |
-| `KEYVAULT_NAME` | Name of the Key Vault (e.g. `vm-terraform-linux-kv`) — used by workflows to whitelist/delist the runner IP |
-| `KEYVAULT_RESOURCE_GROUP` | Resource group containing the Key Vault (e.g. `rg-terraform-vm`) |
+| `RESOURCE_GROUP_NAME` | RG this stack manages — used both as `TF_VAR_resource_group_name` and as the lock target. Must match `resource_group_name` in your tfvars. |
+| `VNET_NAME` | Name of the virtual network (`TF_VAR_vnet_name`) |
+| `RG_LOCK_LEVEL` | Declared lock level: `None`, `CanNotDelete`, or `ReadOnly` |
+| `RG_LOCK_NAME` | Name of the declared lock, e.g. `rg-terraform-vm-lock` |
 
 ## Remote state backend
 
-State is stored in Azure Blob Storage via the `azurerm` backend. The backend
-uses partial configuration — details are supplied at `init` time (by the
-workflows, or the flags shown above for local use). The storage account must
-exist **before** the first run; Terraform cannot bootstrap its own backend:
+State is stored in Azure Blob Storage via the `azurerm` backend, using partial
+configuration. The storage account must exist **before** the first run —
+Terraform cannot bootstrap its own backend:
 
 ```bash
 az group create -n tfstate-rg -l eastus
@@ -148,4 +237,4 @@ az storage container create -n tfstate --account-name <uniquestorageacct>
 ```
 
 Grant the service principal **Storage Blob Data Contributor** on that storage
-account so it can read and write state.
+account.

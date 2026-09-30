@@ -7,7 +7,9 @@ name: "Terraform Plan"
 #   - pull_request opened/reopened -> if a saved plan exists for the PR's head
 #                                  commit (same code), REUSE it as the PR comment
 #                                  (no re-plan). Otherwise plan fresh (fallback).
-#   - push to main / manual     -> plan; save `tfplan`; open an approval issue.
+#   - push to main / manual     -> plan; save `tfplan` + `tfplan.json`; report
+#                                  whether the apply will need the RG lock
+#                                  removed; open an approval issue.
 # Only Terraform-relevant changes trigger a run (`paths`), and providers are
 # cached. `synchronize` is intentionally NOT a PR trigger: pushes to a PR branch
 # are handled by the push run, which avoids two runs racing for the same plan.
@@ -18,6 +20,8 @@ on:
     paths:
       - "**.tf"
       - ".terraform.lock.hcl"
+      - ".github/workflows/tf-plan.yml"
+      - ".github/scripts/rg-lock.sh"
   pull_request:
     branches: [main]
     types: [opened, reopened]
@@ -40,7 +44,7 @@ env:
   TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
 
 jobs:
-  # ── Decide: reuse a previously-saved plan, or run a fresh one ───────────────
+  # -- Decide: reuse a previously-saved plan, or run a fresh one --------------
   check:
     name: Decide plan vs reuse
     runs-on: ubuntu-latest
@@ -93,7 +97,7 @@ jobs:
             core.setOutput('pr_number', String(prNumber));
             core.setOutput('reuse_run_id', String(reuseRunId));
 
-  # ── Reuse path: post the saved plan as the PR comment (no Terraform) ────────
+  # -- Reuse path: post the saved plan as the PR comment (no Terraform) -------
   reuse:
     name: Reuse saved plan
     needs: check
@@ -145,7 +149,7 @@ jobs:
               await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number, body });
             }
 
-  # ── Plan path: run Terraform, save the plan, comment / open issue ───────────
+  # -- Plan path: run Terraform, save the plan, comment / open issue ----------
   plan:
     name: Terraform Plan — LPI-EM-GEC
     needs: check
@@ -157,27 +161,40 @@ jobs:
       ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
       ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
       ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
-      TF_VAR_admin_ssh_public_key: ${{ secrets.ADMIN_SSH_PUBLIC_KEY }}
-      TF_VAR_keyvault_allowed_ip:  ${{ vars.KEYVAULT_ALLOWED_IP }}
+      # TEMPORARY: the vault the teardown has to reach; remove with the steps below.
+      LEGACY_KV_NAME: vm-terraform-linux-kv
+      LEGACY_KV_RG:   rg-terraform-vm
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Whitelist runner IP in Key Vault
+      # Unconditional because the temporary Key Vault step below needs it on
+      # every branch push. Once that step is gone only the lock check needs
+      # Azure, so this can go back to being main/workflow_dispatch only.
+      - name: Azure login
+        run: |
+          az login --service-principal             -u "$ARM_CLIENT_ID" -p "$ARM_CLIENT_SECRET"             --tenant "$ARM_TENANT_ID" --output none
+          az account set --subscription "$ARM_SUBSCRIPTION_ID"
+
+      # >>> TEMPORARY — legacy Key Vault teardown ------------------------------
+      # State still holds azurerm_key_vault_secret.admin_password. Refreshing
+      # (plan) and deleting (apply) it go through the vault's DATA plane, which
+      # its firewall blocks from a runner's IP — and the runner IP changes every
+      # run. Open a hole for this run so the teardown can complete.
+      # DELETE THIS STEP, its twin at the end of the job, and the LEGACY_KV_*
+      # env vars once the vault is gone from state.
+      - name: Whitelist runner IP in the legacy Key Vault
         run: |
           RUNNER_IP=$(curl -sf https://api.ipify.org)
           echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
-          az login --service-principal \
-            -u "$ARM_CLIENT_ID" -p "$ARM_CLIENT_SECRET" \
-            --tenant "$ARM_TENANT_ID" --output none
-          az account set --subscription "$ARM_SUBSCRIPTION_ID"
-          az keyvault network-rule add \
-            --name "${{ vars.KEYVAULT_NAME }}" \
-            --resource-group "${{ vars.KEYVAULT_RESOURCE_GROUP }}" \
-            --ip-address "$RUNNER_IP" \
-            --output none \
-          || echo "::warning::Could not whitelist runner IP — vault may not exist yet (first apply)."
-          sleep 30
+          if az keyvault network-rule add \
+               --name "$LEGACY_KV_NAME" --resource-group "$LEGACY_KV_RG" \
+               --ip-address "$RUNNER_IP" --output none 2>/dev/null; then
+            sleep 30   # the ACL change is not effective immediately
+          else
+            echo "::notice::Legacy Key Vault '$LEGACY_KV_NAME' not reachable or already gone — nothing to whitelist."
+          fi
+      # <<< END TEMPORARY -------------------------------------------------------
 
       - name: Prime plugin cache dir
         run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
@@ -202,11 +219,14 @@ jobs:
             -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
             -backend-config="key=hub-gec.tfstate"
 
+      # A management lock never blocks `plan`: reading ARM is allowed under both
+      # CanNotDelete and ReadOnly, so nothing needs unlocking here.
       - name: Terraform Plan
         id: plan
         run: |
           terraform plan -input=false -no-color -out=tfplan
           terraform show -no-color tfplan | tee plan-to-display.txt
+          terraform show -json    tfplan > tfplan.json
 
       - name: Publish plan to run summary
         run: |
@@ -268,18 +288,33 @@ jobs:
               await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number, body });
             }
 
-      # ── Main / manual: save the binary plan and open an approval issue ───────
+      # -- Main / manual: save the plan and open an approval issue ------------
+
+      # Advisory only: tells the reviewer up front whether approving will lift
+      # the lock. The apply re-evaluates this itself, because the lock can change
+      # between the plan and the approval.
+      - name: Check RG lock against plan
+        id: lock
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+        run: .github/scripts/rg-lock.sh status tfplan.json
+
       - name: Upload tfplan for apply
         if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: tfplan
-          path: tfplan
+          path: |
+            tfplan
+            tfplan.json
           retention-days: 5
 
       - name: Open approval issue with plan
         if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
         uses: actions/github-script@v7
+        env:
+          LOCK_LEVEL:   ${{ steps.lock.outputs.level }}
+          NEEDS_UNLOCK: ${{ steps.lock.outputs.needs_unlock }}
+          DESTROYS:     ${{ steps.lock.outputs.destroys }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -288,11 +323,22 @@ jobs:
             const MAX = 60000;
             if (plan.length > MAX) plan = plan.slice(0, MAX) + '\n\n... (plan truncated). See the workflow run logs for the full plan.';
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const { LOCK_LEVEL, NEEDS_UNLOCK, DESTROYS } = process.env;
+            const lockLine =
+              LOCK_LEVEL === 'None'
+                ? '🔓 **RG lock:** none.'
+                : NEEDS_UNLOCK === 'true'
+                  ? `⚠️ **RG lock:** \`${LOCK_LEVEL}\` — this plan has **${DESTROYS} destroy(s)**, so the apply will temporarily remove the lock and restore it afterwards.`
+                  : `🔒 **RG lock:** \`${LOCK_LEVEL}\` — the plan has no destroys, so the lock stays on for the whole apply.`;
+
             const body = [
               `<!-- plan-run-id: ${context.runId} -->`,
               '### Terraform Plan — Hub (GEC)',
               '',
               `Triggered by @${context.actor} on \`${context.ref}\`. [View run logs](${runUrl})`,
+              '',
+              lockLine,
               '',
               'An authorized reviewer must comment **`/approve`** on this issue to deploy.',
               'Comment **`/deny`** to reject and close without applying.',
@@ -314,13 +360,14 @@ jobs:
             });
             core.notice(`Approval issue opened: ${issue.data.html_url}`);
 
-      - name: Remove runner IP from Key Vault
+      # >>> TEMPORARY — legacy Key Vault teardown ------------------------------
+      # Twin of the whitelist step above; delete both together.
+      - name: Remove runner IP from the legacy Key Vault
         if: always()
         run: |
-          [[ -z "$RUNNER_IP" ]] && exit 0
+          [[ -z "${RUNNER_IP:-}" ]] && exit 0
           az keyvault network-rule remove \
-            --name "${{ vars.KEYVAULT_NAME }}" \
-            --resource-group "${{ vars.KEYVAULT_RESOURCE_GROUP }}" \
-            --ip-address "$RUNNER_IP" \
-            --output none \
-          || true
+            --name "$LEGACY_KV_NAME" --resource-group "$LEGACY_KV_RG" \
+            --ip-address "$RUNNER_IP" --output none 2>/dev/null \
+          || echo "::notice::Could not delist runner IP — the vault is likely already destroyed."
+      # <<< END TEMPORARY -------------------------------------------------------
