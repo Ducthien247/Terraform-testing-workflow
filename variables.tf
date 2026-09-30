@@ -31,5 +31,8 @@ variable "address_space" {
 variable "tags" {
   description = "Tags applied to the resource group and the virtual network."
   type        = map(string)
-  default     = { managed_by = "terraform" }
+  default = {
+    managed_by  = "terraform"
+    environment = "test"
+  }
 }

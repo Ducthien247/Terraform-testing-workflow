@@ -16,15 +16,6 @@ terraform {
 }
 
 provider "azurerm" {
-  features {
-    key_vault {
-      # The old VM template's vault is being destroyed. Soft-delete it rather
-      # than purging: purging needs an extra permission the CI principal may
-      # not hold, and a failed purge fails the whole apply. Drop this block
-      # once the vault is out of state.
-      purge_soft_delete_on_destroy    = false
-      recover_soft_deleted_key_vaults = false
-    }
-  }
+  features {}
   subscription_id = var.subscription_id
 }
