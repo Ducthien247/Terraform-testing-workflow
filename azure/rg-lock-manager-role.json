@@ -1,0 +1,16 @@
+{
+  "Name": "RG Lock Manager",
+  "IsCustom": true,
+  "Description": "Create, read and delete management locks. Granted to the CI service principal so the Terraform apply workflow can lift a CanNotDelete/ReadOnly lock for a destructive apply and restore it afterwards. Intentionally excludes all other authorization actions.",
+  "Actions": [
+    "Microsoft.Authorization/locks/read",
+    "Microsoft.Authorization/locks/write",
+    "Microsoft.Authorization/locks/delete"
+  ],
+  "NotActions": [],
+  "DataActions": [],
+  "NotDataActions": [],
+  "AssignableScopes": [
+    "/subscriptions/5a54b2d5-1e2d-414b-b69a-ebc63bafee95/resourceGroups/rg-terraform-vm"
+  ]
+}
